@@ -13,12 +13,13 @@ from typing import Dict, Tuple
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection, RestEndpoint, Routes, WebsocketEndpoint
-from cryptofeed.defines import BID, ASK, BITFINEX, BUY, CURRENCY, FUNDING, L2_BOOK, L3_BOOK, SELL, TICKER, TRADES, PERPETUAL
+from cryptofeed.defines import BID, ASK, BITFINEX, BUY, CURRENCY, FUNDING, L2_BOOK, L3_BOOK, SELL, TICKER, TRADES, PERPETUAL, CANDLES
 from cryptofeed.exceptions import MissingSequenceNumber
 from cryptofeed.feed import Feed
 from cryptofeed.symbols import Symbol
 from cryptofeed.exchanges.mixins.bitfinex_rest import BitfinexRestMixin
-from cryptofeed.types import Ticker, Trade, OrderBook
+from cryptofeed.types import Ticker, Trade, OrderBook, Candle
+from cryptofeed.util.time import timedelta_str_to_sec
 
 
 LOG = logging.getLogger('feedhandler')
@@ -50,6 +51,7 @@ class Bitfinex(Feed, BitfinexRestMixin):
         L2_BOOK: 'book-P0-{}-{}',
         TRADES: 'trades',
         TICKER: 'ticker',
+        CANDLES: 'candles'
     }
     request_limit = 1
     valid_candle_intervals = {'1m', '5m', '15m', '30m', '1h', '3h', '6h', '12h', '1d', '1w', '2w', '1M'}
@@ -317,6 +319,49 @@ class Bitfinex(Feed, BitfinexRestMixin):
 
         await self.book_callback(L3_BOOK, self._l3_book[pair], timestamp, raw=msg, delta=delta, sequence_number=msg[-1])
 
+    async def _candle(self, pair: str, msg: dict, timestamp: float):
+        """
+        Response Example:
+        [
+            CHANNEL_ID,
+            [
+                MTS,
+                OPEN,
+                CLOSE,
+                HIGH,
+                LOW,
+                VOLUME
+            ]
+        ]
+        [343351,[1574698200000,7399.9,7379.7,7399.9,7371.8,41.63633658]]
+        """
+        if isinstance(msg, list) and len(msg) == 3 and isinstance(msg[1], list) and len(msg[1]) == 6:
+            # candle update
+            mts, open, close, high, low, volume = msg[1]
+            end = self.timestamp_normalize(mts) - 1
+            start = end - timedelta_str_to_sec(self.candle_interval) + 1
+
+            c = Candle(self.id,
+                    pair,
+                    start,
+                    end,
+                    self.candle_interval,
+                    None, # trade count not provided by official websocket response
+                    Decimal(open),
+                    Decimal(close),
+                    Decimal(high),
+                    Decimal(low),
+                    Decimal(volume),
+                    None, # candle closed status not provided by official websocket response
+                    self.timestamp_normalize(mts),
+                    raw=msg)
+            
+            await self.callback(CANDLES, c, timestamp)
+        else:
+            # ignore candle snapshot and heartbeats
+            pass
+
+
     @staticmethod
     async def _do_nothing(msg: list, timestamp: float):
         pass
@@ -351,11 +396,19 @@ class Bitfinex(Feed, BitfinexRestMixin):
             LOG.debug('%s: %s from exchange: %s', conn.uuid, msg['event'], msg)
         elif 'chanId' in msg and 'symbol' in msg:
             self.register_channel_handler(msg, conn)
+        # candle response { event: "subscribe", channel: "candles",  chanId: CHANNEL_ID, key: "trade:1m:tBTCUSD" }
+        elif 'chanId' in msg and 'key' in msg: 
+            self.register_channel_handler(msg, conn)
         else:
             LOG.warning('%s: Unexpected msg from exchange: %s', conn.uuid, msg)
 
     def register_channel_handler(self, msg: dict, conn: AsyncConnection):
-        symbol = msg['symbol']
+        if msg['key'] != None:
+            split_result = msg['key'].rsplit(':', 1) # key: "trade:1m:tBTCUSD"
+            symbol = split_result[-1]
+        else:
+            symbol = msg['symbol']
+
         is_funding = (symbol[0] == 'f')
         pair = self.exchange_symbol_to_std_symbol(symbol)
 
@@ -378,6 +431,11 @@ class Bitfinex(Feed, BitfinexRestMixin):
                 handler = self._do_nothing
             else:
                 handler = partial(self._book, pair)
+        elif msg['channel'] == 'candles':
+            if is_funding:
+                LOG.warning('%s %s: Candle funding not implemented - ignoring for %s', conn.uuid, pair, msg)
+            else:
+                handler = partial(self._candle, pair)
         else:
             LOG.warning('%s %s: Unexpected message %s', conn.uuid, pair, msg)
             return
@@ -410,5 +468,7 @@ class Bitfinex(Feed, BitfinexRestMixin):
                         except IndexError:
                             # any non specified params will be defaulted
                             pass
-
+                if 'candles' in chan:
+                    message['key'] = f"trade:{self.candle_interval}:{pair}"
+    
                 await connection.write(json.dumps(message))
