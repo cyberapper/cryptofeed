@@ -51,7 +51,6 @@ class ClickhouseCallback(BackendQueue):
                 if len(updates) > 0:
                     batch = []
                     for data in updates:
-                        print(data)
                         ts = dt.fromtimestamp(data['timestamp'], tz=timezone.utc) if data['timestamp'] else None
                         rts = dt.fromtimestamp(data['receipt_timestamp'], tz=timezone.utc) if data['receipt_timestamp'] else None
                         batch.append((data['exchange'], data['symbol'], ts, rts, data))
